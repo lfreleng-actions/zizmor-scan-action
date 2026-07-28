@@ -18,3 +18,41 @@ dependencies = [
 
 [tool.uv]
 package = false
+
+# Pin the ruff rule set explicitly.
+#
+# Without a `select`, ruff applies its *default* rule set, and that
+# default is not stable across releases:
+#
+#     ruff 0.15.22 ->  59 rules across  2 categories (E, F)
+#     ruff 0.16.0  -> 413 rules across 38 categories
+#
+# A routine pre-commit autoupdate crossing that boundary changed which
+# rules run and broke fifteen repositories in this organisation at once,
+# on code nobody had touched.
+#
+# Selecting these categories switches every other rule off.  That is the
+# point: adopting more becomes a deliberate, reviewed edit to this file
+# rather than a side effect of a version bump.
+#
+# `line-length` and `target-version` are intentionally left unset so
+# ruff's own defaults continue to apply unchanged.
+
+[tool.ruff.lint]
+# The de facto standard across this organisation: present as a superset
+# in 13 of the 16 repositories that already pin their rules.
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+
+ignore = [
+  "E501", # line-too-long: the formatter owns line length
+  "B008", # function call in argument default: typer/click idiom
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test suites legitimately break rules that matter in library code.
+# Listed even where not currently selected, so that widening `select`
+# later does not immediately flag every test module.  PLR0917 in
+# particular cannot be satisfied by tests that stack `@patch`
+# decorators: unittest.mock injects its mocks positionally, so a
+# keyword-only signature is impossible, not merely inconvenient.
+"tests/**/*.py" = ["S101", "ARG", "PLR0913", "PLR0917", "PLR2004"]
