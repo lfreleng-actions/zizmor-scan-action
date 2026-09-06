@@ -13,7 +13,7 @@ version = "0.0.0"
 description = "Version pin for the zizmor auditor run by this composite action."
 requires-python = ">=3.11"
 dependencies = [
-    "zizmor==1.29.0",
+    "zizmor==1.30.0",
 ]
 
 [tool.uv]
