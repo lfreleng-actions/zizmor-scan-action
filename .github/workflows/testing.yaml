@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: 2026 The Linux Foundation
 
 # Self-test: run this repository's composite action against its own
-# workflow definitions. Uses the local action via './'.
+# workflow definitions. Uses the local action via '$/'.
 name: "Test GitHub Action 🧪"
 
 # yamllint disable-line rule:truthy
@@ -54,7 +54,7 @@ jobs:
           persist-credentials: false
 
       - name: "Run zizmor audit"
-        uses: "./"
+        uses: $/
         with:
           # The scheduled org-wide publisher (lfreleng-actions/.github
           # workflow zizmor-sarif-publish.yaml) is now the single source of
