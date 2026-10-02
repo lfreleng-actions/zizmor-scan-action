@@ -269,7 +269,7 @@ runs:
         ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
-        python3 "${ACTION_PATH}/.github/scripts/zizmor_summary.py"
+        python3 "${ACTION_PATH}/scripts/zizmor_summary.py"
 
     - name: 'Upload SARIF to code scanning'
       if: >-
