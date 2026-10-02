@@ -56,3 +56,12 @@ ignore = [
 # decorators: unittest.mock injects its mocks positionally, so a
 # keyword-only signature is impossible, not merely inconvenient.
 "tests/**/*.py" = ["S101", "ARG", "PLR0913", "PLR0917", "PLR2004"]
+
+[tool.basedpyright]
+# The summary script runs on the runner's system python3, not under
+# requires-python above; Ubuntu 22.04 runners ship 3.10.
+pythonVersion = "3.10"
+pythonPlatform = "All"
+typeCheckingMode = "standard"
+# Same directories as the hook's args, so editors and bare runs match it.
+include = ["scripts"]
