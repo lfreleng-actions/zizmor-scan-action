@@ -62,3 +62,91 @@ jobs:
           # self-test only verifies the action runs end to end, so it must not
           # upload a second, competing analysis lineage to code scanning.
           upload-sarif: "false"
+
+  # The action runs in the caller's workspace. Plant modules there that
+  # its Python calls import; each records its import and exits. Audit
+  # an empty directory so zizmor exits 3 and the empty-SARIF fallback
+  # runs as well as the JSON check and the summary.
+  workspace-isolation:
+    name: "Workspace isolation"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
+        with:
+          config: '@aa81113fe43792f29f939c79ea47a04801cf5342'  # v0.4.1
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Plant Python modules in the workspace"
+        shell: bash
+        run: |
+          set -euo pipefail
+          planted='import os
+          import sys
+
+          marker = os.path.join(os.environ["RUNNER_TEMP"], "planted-ran")
+          with open(marker, "a") as handle:
+              handle.write(__name__ + "\n")
+          sys.exit(97)
+          '
+          mkdir -p json nothing-to-audit
+          for target in sitecustomize.py re.py json/__init__.py; do
+            printf '%s' "${planted}" > "${target}"
+          done
+
+      - name: "Run zizmor audit with planted modules present"
+        id: audit
+        uses: $/
+        with:
+          working-directory: nothing-to-audit
+          upload-sarif: "false"
+
+      - name: "Verify the SARIF and that no planted module ran"
+        shell: bash
+        env:
+          SARIF: ${{ steps.audit.outputs.sarif-file }}
+        run: |
+          set -euo pipefail
+          if [ -e "${RUNNER_TEMP}/planted-ran" ]; then
+            echo "Error: the action imported modules from the workspace:"
+            cat "${RUNNER_TEMP}/planted-ran"
+            exit 1
+          fi
+          jq -e '.runs[0].tool.driver.name == "zizmor"
+            and .runs[0].results == []' "${SARIF}"
+          echo "Only the action's own Python code ran"
+
+      - name: "Run zizmor audit with an empty PYTHONPATH entry"
+        id: audit-pythonpath
+        uses: $/
+        # A trailing empty entry, as an earlier step of a caller's job
+        # may leave, puts the working directory on sys.path in every mode
+        env:
+          PYTHONPATH: '/nonexistent:'
+        with:
+          working-directory: nothing-to-audit
+          upload-sarif: "false"
+
+      - name: "Verify again with the empty PYTHONPATH entry"
+        shell: bash
+        env:
+          SARIF: ${{ steps.audit-pythonpath.outputs.sarif-file }}
+        run: |
+          set -euo pipefail
+          if [ -e "${RUNNER_TEMP}/planted-ran" ]; then
+            echo "Error: the action imported modules from the workspace:"
+            cat "${RUNNER_TEMP}/planted-ran"
+            exit 1
+          fi
+          jq -e '.runs[0].results == []' "${SARIF}"
+          echo "Only the action's own Python code ran"
