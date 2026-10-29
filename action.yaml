@@ -228,7 +228,9 @@ runs:
           # indentation ever changes they must move with it, or the
           # heredoc will not terminate. Each Python statement is
           # top-level or a bracket continuation, so none needs indenting.
-          python3 - "${ver}" > "${tmp}" <<'PY'
+          # -I keeps the working directory (the audited workspace) off
+          # sys.path, so json is the standard library module.
+          python3 -I - "${ver}" > "${tmp}" <<'PY'
         import json, sys
         v = sys.argv[1]
         schema = ("https://docs.oasis-open.org/sarif/sarif/v2.1.0/"
@@ -250,7 +252,7 @@ runs:
           echo "::error::zizmor exited with code ${rc}" >&2
           exit "${rc}"
         fi
-        python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "${tmp}"
+        python3 -I -c 'import json,sys; json.load(open(sys.argv[1]))' "${tmp}"
         mv "${tmp}" "${sarif}"
         echo "sarif=${sarif}" >> "$GITHUB_OUTPUT"
         bytes=$(wc -c < "${sarif}" | tr -d ' ')
@@ -269,7 +271,7 @@ runs:
         ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
-        python3 "${ACTION_PATH}/scripts/zizmor_summary.py"
+        python3 -I "${ACTION_PATH}/scripts/zizmor_summary.py"
 
     - name: 'Upload SARIF to code scanning'
       if: >-
