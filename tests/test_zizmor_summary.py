@@ -127,7 +127,6 @@ class AnnotateTest(unittest.TestCase):
         self.assertTrue(found[1].startswith("::warning "))
         self.assertIn("endLine=22", found[1])
 
-    @unittest.expectedFailure
     def test_unset_emits_no_annotations(self) -> None:
         """Unset behaves as aislop_summary.py does: annotations off."""
         unset_lines, unset_summary, unset_rc = self.run_summary(None)
@@ -137,13 +136,11 @@ class AnnotateTest(unittest.TestCase):
         self.assertEqual(unset_lines, false_lines)
         self.assertEqual(unset_summary, false_summary)
 
-    @unittest.expectedFailure
     def test_false_emits_no_annotations(self) -> None:
         lines, _, rc = self.run_summary("false")
         self.assertEqual(rc, 0)
         self.assertEqual(self.annotations(lines), [])
 
-    @unittest.expectedFailure
     def test_false_keeps_summary_and_listing(self) -> None:
         false_lines, false_summary, false_rc = self.run_summary("false")
         true_lines, true_summary, true_rc = self.run_summary("true")

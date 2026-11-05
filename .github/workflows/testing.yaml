@@ -182,3 +182,84 @@ jobs:
           fi
           jq -e '.runs[0].results == []' "${SARIF}"
           echo "Only the action's own Python code ran"
+
+  # Audit a planted workflow with known findings with annotations off:
+  # the action still succeeds and still writes the SARIF. A value other
+  # than 'true' or 'false' fails the action.
+  annotate-off:
+    name: "Annotate off"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
+        with:
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d'  # v0.19.0
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      # Written at run time so the repository holds no insecure workflow
+      # for other scans to report.
+      - name: "Plant a workflow with known findings"
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir=annotate-fixture/.github/workflows
+          mkdir -p "${dir}"
+          printf '%s\n' \
+            'on: push' \
+            'permissions: {}' \
+            'jobs:' \
+            '  build:' \
+            '    runs-on: ubuntu-latest' \
+            '    steps:' \
+            '      - uses: actions/checkout@v4' \
+            > "${dir}/fixture.yaml"
+
+      - name: "Run zizmor audit with annotations off"
+        id: audit
+        uses: $/
+        with:
+          working-directory: annotate-fixture
+          annotate: "false"
+          upload-sarif: "false"
+
+      - name: "Verify the SARIF holds the known finding"
+        shell: bash
+        env:
+          SARIF: ${{ steps.audit.outputs.sarif-file }}
+        run: |
+          set -euo pipefail
+          test -s "${SARIF}"
+          jq -e 'any(.runs[0].results[]; .ruleId == "zizmor/unpinned-uses")' \
+            "${SARIF}"
+          echo "The audit succeeded and wrote ${SARIF}"
+
+      - name: "Run zizmor audit with an invalid annotate value"
+        id: invalid
+        continue-on-error: true
+        uses: $/
+        with:
+          working-directory: annotate-fixture
+          annotate: "yes"
+          upload-sarif: "false"
+
+      - name: "Verify the invalid value failed the action"
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.invalid.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "${OUTCOME}" != "failure" ]; then
+            echo "Error: annotate: 'yes' did not fail (${OUTCOME})"
+            exit 1
+          fi
+          echo "annotate: 'yes' failed as expected"

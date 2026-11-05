@@ -84,8 +84,8 @@ pushes.
    and verifies its Sigstore provenance with `gh attestation verify`
    before it runs. A binary that fails verification aborts the run.
 3. zizmor audits the workspace in SARIF mode.
-4. The action writes a findings summary to the job summary and emits
-   inline annotations.
+4. The action writes a findings summary to the job summary and, unless
+   `annotate` is `'false'`, emits inline annotations.
 5. When `upload-sarif` is `'true'`, the action publishes the SARIF to
    code scanning. The example workflows set this for default-branch
    pushes and keep pull request runs advisory.
@@ -103,10 +103,32 @@ pushes.
 | `zizmor-version`     | `""`            | Override the bundled pin with an explicit tag (for example `v1.25.2`).                        |
 | `extra-args`         | `""`            | Extra raw arguments appended to the zizmor call.                                              |
 | `upload-sarif`       | `'false'`       | Publish SARIF to code scanning from the action: `'true'` or `'false'`.                        |
+| `annotate`           | `'true'`        | Emit inline annotations for the top findings: `'true'` or `'false'`.                          |
 | `summary-repository` | `""`            | owner/repo label for step-summary links; takes effect when paired with a valid `summary-sha`. |
 | `summary-sha`        | `""`            | Commit SHA (7–40 hex digits) for step-summary links; pairs with `summary-repository`.         |
 
 <!-- markdownlint-enable MD013 -->
+
+Set `annotate` to `'false'` for a scan whose findings do not belong to
+the current run. A gate that scans both the pull request head and its
+merge base, so that it fails on the findings the pull request adds and
+not on older ones, turns annotations off for the base scan. Otherwise
+the base scan's annotations attach to the run, and findings the pull
+request has already fixed still show as warnings or errors on it. The
+job summary, the SARIF file, the outputs and the exit status stay the
+same either way.
+
+<!-- markdownlint-disable MD013 MD046 -->
+
+```yaml
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/zizmor-scan-action@<commit-sha>  # vX.Y.Z
+        with:
+          working-directory: base
+          annotate: 'false'
+```
+
+<!-- markdownlint-enable MD013 MD046 -->
 
 ## Outputs
 

@@ -52,6 +52,11 @@ inputs:
     description: 'Upload the SARIF to code scanning from within this action.'
     required: false
     default: 'false'
+  annotate:
+    description: >-
+      Emit inline annotations for the top findings: 'true' or 'false'.
+    required: false
+    default: 'true'
   summary-repository:
     description: >-
       owner/repo label for step-summary links; defaults to the
@@ -78,6 +83,20 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    - name: 'Validate inputs'
+      shell: 'bash'
+      env:
+        ANNOTATE: ${{ inputs.annotate }}
+      run: |
+        set -euo pipefail
+        case "${ANNOTATE}" in
+          true|false) ;;
+          *)
+            echo "::error::annotate must be 'true' or 'false'"
+            exit 1
+            ;;
+        esac
+
     - name: 'Resolve zizmor version'
       id: 'resolve'
       shell: 'bash'
@@ -268,6 +287,7 @@ runs:
         ZIZMOR_TOP_N: '10'
         ZIZMOR_REPOSITORY: ${{ inputs.summary-repository }}
         ZIZMOR_SHA: ${{ inputs.summary-sha }}
+        ZIZMOR_ANNOTATE: ${{ inputs.annotate }}
         ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
