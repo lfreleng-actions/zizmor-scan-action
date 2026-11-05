@@ -4,8 +4,9 @@
 
 Read the SARIF file at ``$ZIZMOR_SARIF`` and write a human-readable
 markdown summary to ``$GITHUB_STEP_SUMMARY``. Also emit a compact
-listing to stdout and ``::warning``/``::error``/``::notice`` workflow
-commands for the top findings so they surface as inline PR annotations.
+listing to stdout and, when ``ZIZMOR_ANNOTATE`` is ``true``,
+``::warning``/``::error``/``::notice`` workflow commands for the top
+findings so they surface as inline PR annotations.
 
 Configuration is read from the environment:
 
@@ -15,6 +16,9 @@ Configuration is read from the environment:
 * ``ZIZMOR_MIN_SEVERITY`` minimum severity label shown in the header
 * ``ZIZMOR_REPOSITORY``   owner/repo label override for summary links
 * ``ZIZMOR_SHA``          commit SHA override for summary links
+* ``ZIZMOR_ANNOTATE``     emit annotations only when ``true``; unset or
+  any other value turns them off without changing the summary, the
+  listing or the exit code (the action passes ``true`` by default)
 """
 
 import json
@@ -201,6 +205,7 @@ def _read_context() -> dict[str, Any]:
         "short_sha": sha[:7] if sha else "?",
         "persona": os.environ.get("ZIZMOR_PERSONA", "auditor"),
         "min_severity": os.environ.get("ZIZMOR_MIN_SEVERITY", "informational"),
+        "annotate": os.environ.get("ZIZMOR_ANNOTATE", "") == "true",
     }
 
 
@@ -330,7 +335,8 @@ def summarise() -> int:
     _write(out, ctx["summary_path"])
 
     _print_console(findings, level_counts, rule_counts, ctx["top_n"])
-    _emit_annotations(findings, ctx["top_n"])
+    if ctx["annotate"]:
+        _emit_annotations(findings, ctx["top_n"])
     return 0
 
 
