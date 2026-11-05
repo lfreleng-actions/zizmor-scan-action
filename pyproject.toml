@@ -59,8 +59,9 @@ ignore = [
 
 [tool.basedpyright]
 # The summary script runs on the runner's system python3, not under
-# requires-python above; Ubuntu 22.04 runners ship 3.10.
-pythonVersion = "3.10"
+# requires-python above. Python 3.10 is end of life, so type-check
+# against 3.11, the floor requires-python sets.
+pythonVersion = "3.11"
 pythonPlatform = "All"
 typeCheckingMode = "standard"
 # Same directories as the hook's args, so editors and bare runs match it.
