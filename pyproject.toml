@@ -3,9 +3,10 @@
 
 # This project exists solely to pin the zizmor version that the composite
 # action installs, and to let Dependabot's `uv` ecosystem keep that pin
-# current. Nothing is built, installed, or published from it; the action
+# current. Nothing is built, installed, or published from it. The action
 # reads the pinned version from this file at run time and then downloads
-# the matching attested zizmor release binary.
+# the matching attested zizmor release binary. If GitHub is unavailable it
+# falls back to the PyPI wheel whose URL and SHA-256 digest uv.lock pins.
 
 [project]
 name = "zizmor-scan-action-pin"

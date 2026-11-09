@@ -9,16 +9,23 @@ nothing here touches the network or sleeps. Run with
 ``python3 -m unittest discover -s tests``.
 """
 
+import __future__
+
 import contextlib
 import email.message
 import hashlib
+import http.client
+import http.server
 import importlib.util
 import io
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
+import time
 import unittest
 import urllib.error
 import zipfile
@@ -101,11 +108,18 @@ def make_tarball(content: bytes = PRIMARY_BINARY) -> bytes:
 
 
 def make_wheel(content: bytes = FALLBACK_BINARY, version: str = VERSION) -> bytes:
-    """Build a PyPI wheel carrying the binary under ``.data/scripts``."""
+    """Build a PyPI wheel carrying the binary under ``.data/scripts``.
+
+    The archive is byte-for-byte reproducible: a fixed timestamp keeps
+    two builds of the same content from differing across a clock tick.
+    """
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as wheel:
-        wheel.writestr(f"zizmor-{version}.data/scripts/zizmor", content)
-        wheel.writestr(f"zizmor-{version}.dist-info/METADATA", "Name: zizmor\n")
+        for name, data in (
+            (f"zizmor-{version}.data/scripts/zizmor", content),
+            (f"zizmor-{version}.dist-info/METADATA", b"Name: zizmor\n"),
+        ):
+            wheel.writestr(zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0)), data)
     return buffer.getvalue()
 
 
@@ -145,7 +159,6 @@ def http_error(code: int) -> urllib.error.HTTPError:
     )
 
 
-@unittest.expectedFailure  # TEMPORARY: removed with the implementation
 class RetryTests(unittest.TestCase):
     def setUp(self) -> None:
         # Keep the retry notices out of the test run's output.
@@ -165,7 +178,7 @@ class RetryTests(unittest.TestCase):
         outcomes = [mod.TransientError("boom")] * 4
         calls: list[int] = []
 
-        def operation() -> str:
+        def operation(remaining: float) -> str:
             calls.append(1)
             if outcomes:
                 raise outcomes.pop()
@@ -186,7 +199,7 @@ class RetryTests(unittest.TestCase):
         schedule = fake.schedule()
         calls: list[int] = []
 
-        def operation() -> None:
+        def operation(remaining: float) -> None:
             calls.append(1)
             raise mod.TransientError("still down")
 
@@ -205,7 +218,7 @@ class RetryTests(unittest.TestCase):
         schedule = fake.schedule()
         calls: list[int] = []
 
-        def operation() -> None:
+        def operation(remaining: float) -> None:
             calls.append(1)
             fake.now += 60
             raise mod.TransientError("slow failure")
@@ -227,7 +240,7 @@ class RetryTests(unittest.TestCase):
         schedule = fake.schedule()
         calls: list[int] = []
 
-        def operation() -> None:
+        def operation(remaining: float) -> None:
             calls.append(1)
             raise mod.IntegrityError("hash mismatch")
 
@@ -246,7 +259,7 @@ class RetryTests(unittest.TestCase):
         schedule = fake.schedule(lowest=True)
         outcomes = [mod.TransientError("boom")] * 4
 
-        def operation() -> str:
+        def operation(remaining: float) -> str:
             if outcomes:
                 raise outcomes.pop()
             return "done"
@@ -259,25 +272,217 @@ class RetryTests(unittest.TestCase):
         )
         self.assertEqual(fake.sleeps, [7.5, 15, 30, 60])
 
+    def test_each_attempt_is_told_how_much_budget_remains(self) -> None:
+        mod, fake = transfer(), FakeTime()
+        schedule = fake.schedule()
+        seen: list[float] = []
 
-@unittest.expectedFailure  # TEMPORARY: removed with the implementation
+        def operation(remaining: float) -> None:
+            seen.append(remaining)
+            fake.now += 30
+            raise mod.TransientError("slow failure")
+
+        with self.assertRaises(mod.TransientError):
+            mod.retry_call(
+                operation,
+                label="test",
+                schedule=schedule,
+                deadline=fake.clock() + schedule.budget,
+            )
+        # 180; then 180 - 30 - 10; then 180 - 30 - 10 - 30 - 20; and so on.
+        self.assertEqual(seen, [180, 140, 90, 20])
+
+    def test_no_attempt_starts_once_the_budget_is_spent(self) -> None:
+        mod, fake = transfer(), FakeTime()
+        schedule = fake.schedule()
+        calls: list[int] = []
+
+        def operation(remaining: float) -> None:
+            calls.append(1)
+            raise mod.TransientError("down")
+
+        # A real sleep can overshoot; model one that lands past the deadline.
+        def overshooting_sleep(seconds: float) -> None:
+            fake.now += seconds + 500
+
+        schedule = mod.RetrySchedule(
+            sleep=overshooting_sleep, clock=fake.clock, rand=lambda lo, hi: hi
+        )
+        with self.assertRaises(mod.TransientError) as caught:
+            mod.retry_call(
+                operation,
+                label="test",
+                schedule=schedule,
+                deadline=fake.clock() + schedule.budget,
+            )
+        self.assertEqual(len(calls), 1)
+        self.assertIn("down", str(caught.exception))
+
+
+class FakeResponse:
+    """A response double: ``read`` hands out the chunks, then EOF."""
+
+    def __init__(self, chunks: list[bytes], length: int | None = None) -> None:
+        self.chunks = list(chunks)
+        self.headers = {} if length is None else {"Content-Length": str(length)}
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def read(self, size: int = -1) -> bytes:
+        return self.chunks.pop(0) if self.chunks else b""
+
+
+@contextlib.contextmanager
+def stalling_server(script: Any) -> Any:
+    """Serve one scripted response on localhost; yield its URL.
+
+    ``script`` receives the request handler and may sleep, which stands
+    in for a CDN that accepts a connection and then goes quiet.
+    """
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            script(self)
+
+        def log_message(self, *args: object) -> None:
+            return None
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/asset"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 class DownloadTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.dest = Path(self.tmp.name) / "download"
 
+    def serve(self, mod: ModuleType, response: Any) -> Any:
+        return mock.patch.object(mod.urllib.request, "urlopen", return_value=response)
+
     def test_writes_the_response_body(self) -> None:
         mod = transfer()
-        with mock.patch.object(
-            mod.urllib.request, "urlopen", return_value=io.BytesIO(b"payload")
-        ):
+        with self.serve(mod, FakeResponse([b"pay", b"load"], length=7)):
             mod.download_file("https://example.invalid/a", self.dest)
         self.assertEqual(self.dest.read_bytes(), b"payload")
 
+    def test_a_body_without_a_declared_length_is_accepted(self) -> None:
+        mod = transfer()
+        with self.serve(mod, FakeResponse([b"payload"])):
+            mod.download_file("https://example.invalid/a", self.dest)
+        self.assertEqual(self.dest.read_bytes(), b"payload")
+
+    def test_a_truncated_body_is_transient(self) -> None:
+        # http.client hands back what arrived and reports a clean EOF when
+        # the connection drops early, so the length must be checked.
+        mod = transfer()
+        with self.serve(mod, FakeResponse([b"pay"], length=7)):
+            with self.assertRaises(mod.TransientError) as caught:
+                mod.download_file("https://example.invalid/a", self.dest)
+        self.assertIn("3 of 7", str(caught.exception))
+
+    def test_an_incomplete_chunked_body_is_transient(self) -> None:
+        mod = transfer()
+
+        class Broken(FakeResponse):
+            def read(self, size: int = -1) -> bytes:
+                raise http.client.IncompleteRead(b"pay", 4)
+
+        with self.serve(mod, Broken([])):
+            with self.assertRaises(mod.TransientError):
+                mod.download_file("https://example.invalid/a", self.dest)
+
+    def test_the_deadline_holds_while_the_server_says_nothing(self) -> None:
+        # The server sends headers, then goes quiet for 6 s; the 1 s
+        # limit, not the 30 s socket default, must end the attempt.
+        mod = transfer()
+
+        def script(handler: http.server.BaseHTTPRequestHandler) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Length", "100")
+            handler.end_headers()
+            handler.wfile.flush()
+            time.sleep(6)
+
+        with stalling_server(script) as url:
+            started = time.monotonic()
+            with self.assertRaises(mod.TransientError):
+                mod.download_file(url, self.dest, timeout=1)
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 4)
+
+    def test_the_deadline_holds_against_a_slow_drip(self) -> None:
+        # One byte every 0.2 s never trips a per-read timeout, but the
+        # whole transfer must still end at the deadline.
+        mod = transfer()
+
+        def script(handler: http.server.BaseHTTPRequestHandler) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Length", "1000")
+            handler.end_headers()
+            for _ in range(1000):
+                handler.wfile.write(b"x")
+                handler.wfile.flush()
+                time.sleep(0.2)
+
+        with stalling_server(script) as url:
+            started = time.monotonic()
+            with self.assertRaises(mod.TransientError):
+                mod.download_file(url, self.dest, timeout=1)
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 4)
+
+    def test_a_server_that_closes_early_is_transient(self) -> None:
+        mod = transfer()
+
+        def script(handler: http.server.BaseHTTPRequestHandler) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Length", "100")
+            handler.end_headers()
+            handler.wfile.write(b"only a little")
+            handler.wfile.flush()
+            handler.close_connection = True
+
+        with stalling_server(script) as url:
+            with self.assertRaises(mod.TransientError) as caught:
+                mod.download_file(url, self.dest, timeout=10)
+        self.assertIn("13 of 100", str(caught.exception))
+
+    def test_a_complete_download_from_a_real_server_succeeds(self) -> None:
+        mod = transfer()
+
+        def script(handler: http.server.BaseHTTPRequestHandler) -> None:
+            handler.send_response(200)
+            handler.send_header("Content-Length", "7")
+            handler.end_headers()
+            handler.wfile.write(b"payload")
+
+        with stalling_server(script) as url:
+            mod.download_file(url, self.dest, timeout=10)
+        self.assertEqual(self.dest.read_bytes(), b"payload")
+
+    def test_the_socket_timeout_never_exceeds_the_remaining_budget(self) -> None:
+        mod = transfer()
+        with mock.patch.object(
+            mod.urllib.request, "urlopen", return_value=FakeResponse([b"x"], length=1)
+        ) as urlopen:
+            mod.download_file("https://example.invalid/a", self.dest, timeout=12)
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 12)
+
     def test_gateway_errors_are_transient(self) -> None:
         mod = transfer()
-        for code in (408, 429, 500, 502, 503, 504):
+        for code in (408, 425, 429, 500, 502, 503, 504, 507, 520, 524, 599):
             with self.subTest(code=code):
                 with mock.patch.object(
                     mod.urllib.request, "urlopen", side_effect=http_error(code)
@@ -285,14 +490,16 @@ class DownloadTests(unittest.TestCase):
                     with self.assertRaises(mod.TransientError):
                         mod.download_file("https://example.invalid/a", self.dest)
 
-    def test_missing_asset_is_permanent(self) -> None:
+    def test_client_errors_are_permanent(self) -> None:
         mod = transfer()
-        with mock.patch.object(
-            mod.urllib.request, "urlopen", side_effect=http_error(404)
-        ):
-            with self.assertRaises(mod.FetchError) as caught:
-                mod.download_file("https://example.invalid/a", self.dest)
-        self.assertNotIsInstance(caught.exception, mod.TransientError)
+        for code in (400, 401, 403, 404, 410, 451):
+            with self.subTest(code=code):
+                with mock.patch.object(
+                    mod.urllib.request, "urlopen", side_effect=http_error(code)
+                ):
+                    with self.assertRaises(mod.FetchError) as caught:
+                        mod.download_file("https://example.invalid/a", self.dest)
+                self.assertNotIsInstance(caught.exception, mod.TransientError)
 
     def test_connection_failures_are_transient(self) -> None:
         mod = transfer()
@@ -309,7 +516,6 @@ class DownloadTests(unittest.TestCase):
                         mod.download_file("https://example.invalid/a", self.dest)
 
 
-@unittest.expectedFailure  # TEMPORARY: removed with the implementation
 class VerifyTests(unittest.TestCase):
     def test_success_returns_quietly(self) -> None:
         mod = transfer()
@@ -319,6 +525,15 @@ class VerifyTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(command[:3], ["gh", "attestation", "verify"])
         self.assertIn("zizmorcore/zizmor", command)
+
+    def test_the_check_is_bounded_by_the_remaining_budget(self) -> None:
+        mod = transfer()
+        done = subprocess.CompletedProcess([], 0, stdout="ok", stderr="")
+        with mock.patch.object(mod.subprocess, "run", return_value=done) as run:
+            mod.verify_attestation(Path("/tmp/archive.tar.gz"), timeout=25)
+            mod.verify_attestation(Path("/tmp/archive.tar.gz"), timeout=9999)
+        timeouts = [call.kwargs["timeout"] for call in run.call_args_list]
+        self.assertEqual(timeouts, [25, mod.ATTESTATION_TIMEOUT])
 
     def test_failure_is_transient_so_it_is_retried(self) -> None:
         mod = transfer()
@@ -346,7 +561,6 @@ class VerifyTests(unittest.TestCase):
         self.assertNotIsInstance(caught.exception, mod.TransientError)
 
 
-@unittest.expectedFailure  # TEMPORARY: removed with the implementation
 class AssetTests(unittest.TestCase):
     def test_release_asset_for_each_supported_platform(self) -> None:
         mod = load()
@@ -367,7 +581,6 @@ class AssetTests(unittest.TestCase):
         self.assertIn("unsupported runner Windows/X64", str(caught.exception))
 
 
-@unittest.expectedFailure  # TEMPORARY: removed with the implementation
 class WheelSelectionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.lock = lock_text(make_wheel())
@@ -398,6 +611,13 @@ class WheelSelectionTests(unittest.TestCase):
         url, _ = mod.select_wheel(lock, VERSION, "Linux", "X64")
         self.assertTrue(url.endswith("musllinux_1_2_x86_64.whl"))
 
+    def test_names_the_python_requirement_when_tomllib_is_missing(self) -> None:
+        mod = load()
+        with mock.patch.dict(sys.modules, {"tomllib": None}):
+            with self.assertRaises(mod.FetchError) as caught:
+                mod.select_wheel(self.lock, VERSION, "Linux", "X64")
+        self.assertIn("Python 3.11", str(caught.exception))
+
     def test_refuses_a_version_the_lock_does_not_pin(self) -> None:
         mod = load()
         with self.assertRaises(mod.FetchError) as caught:
@@ -426,7 +646,6 @@ class WheelSelectionTests(unittest.TestCase):
             mod.select_wheel(lock, VERSION, "Linux", "X64")
 
 
-@unittest.expectedFailure  # TEMPORARY: removed with the implementation
 class ExtractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -473,7 +692,6 @@ class ExtractTests(unittest.TestCase):
             mod.extract_from_wheel(wheel, VERSION, self.bindir)
 
 
-@unittest.expectedFailure  # TEMPORARY: removed with the implementation
 class FetchTests(unittest.TestCase):
     """The primary source, the fallback, and the choice between them."""
 
@@ -489,12 +707,14 @@ class FetchTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.work = self.root / "work"
         self.work.mkdir()
+        # One wheel, so the digest in the lock is the digest of the file
+        # the fake downloader serves.
+        self.wheel = make_wheel()
         self.lock = self.root / "uv.lock"
-        self.lock.write_text(lock_text(make_wheel()))
+        self.lock.write_text(lock_text(self.wheel))
         self.fake = FakeTime()
         self.urls: list[str] = []
         self.tarball = make_tarball()
-        self.wheel = make_wheel()
         # Failures to raise for each host; None means the host answers.
         self.github_error: Exception | None = None
         self.pypi_error: Exception | None = None
@@ -509,7 +729,7 @@ class FetchTests(unittest.TestCase):
             raise error
         dest.write_bytes(self.tarball if github else self.wheel)
 
-    def verify(self, archive: Path) -> None:
+    def verify(self, archive: Path, **_: Any) -> None:
         if self.verify_error is not None:
             raise self.verify_error
 
@@ -600,6 +820,38 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(len(self.urls), 10)
         self.assertEqual(self.fake.sleeps, [10, 20, 40, 80] * 2)
 
+    def test_a_slow_github_source_cannot_delay_the_fallback_past_its_budget(
+        self,
+    ) -> None:
+        # Every GitHub attempt burns 100 s before failing: the first waits
+        # 10 s and the second starts with 70 s left; neither may outlast
+        # the 180 s budget, so the fallback starts at 180 s at the latest.
+        seen: list[float] = []
+
+        def slow(url: str, dest: Path, timeout: float = 0, **_: Any) -> None:
+            if "github.com" in url:
+                seen.append(timeout)
+                self.fake.now += min(100, timeout)
+                raise transfer().TransientError("HTTP 504")
+            dest.write_bytes(self.wheel)
+
+        with (
+            mock.patch.object(self.mod, "download_file", slow),
+            mock.patch.object(self.mod, "verify_attestation", self.verify),
+            contextlib.redirect_stderr(self.stderr),
+        ):
+            result = self.mod.fetch(
+                tag=TAG,
+                system="Linux",
+                arch="X64",
+                workdir=self.work,
+                lock_path=self.lock,
+                schedule=self.fake.schedule(),
+            )
+        self.assertEqual(result.source, "pypi")
+        self.assertLessEqual(self.fake.now, 180)
+        self.assertTrue(all(0 < t <= 180 for t in seen), seen)
+
     def test_the_attestation_check_shares_the_source_retry_budget(self) -> None:
         self.verify_error = transfer().TransientError("HTTP 502")
         self.run_fetch()
@@ -609,7 +861,43 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(self.fake.sleeps, [10, 20, 40, 80])
 
 
-@unittest.expectedFailure  # TEMPORARY: removed with the implementation
+def python39() -> str | None:
+    """Find a Python 3.9 interpreter, or None when the host has none."""
+    return os.environ.get("ZIZMOR_TEST_PYTHON39") or shutil.which("python3.9")
+
+
+class OldPythonTests(unittest.TestCase):
+    """The GitHub source is documented to work on Python 3.9 and newer."""
+
+    def test_annotations_are_never_evaluated_at_import(self) -> None:
+        # ``X | None`` in an annotation raises TypeError on Python 3.9 when
+        # evaluated. ``from __future__ import annotations`` stores the
+        # annotations as text, so the module imports on any version. This
+        # check runs on every Python, not just 3.9, so CI catches it.
+        for module in (load(), transfer()):
+            with self.subTest(module=module.__name__):
+                self.assertIs(
+                    getattr(module, "annotations", None), __future__.annotations
+                )
+
+    def test_imports_on_a_real_python_39(self) -> None:
+        interpreter = python39()
+        if interpreter is None:
+            self.skipTest("no python3.9 on this host (set ZIZMOR_TEST_PYTHON39)")
+        code = (
+            f"import sys; sys.path.insert(0, {str(SCRIPTS)!r}); "
+            "import zizmor_fetch; print(sys.version_info[:2])"
+        )
+        proc = subprocess.run(  # noqa: S603
+            [interpreter, "-E", "-s", "-c", code],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "(3, 9)")
+
+
 class CommandLineTests(unittest.TestCase):
     def run_script(self, **env: str) -> subprocess.CompletedProcess[str]:
         clean = {k: v for k, v in os.environ.items() if not k.startswith("ZIZMOR_")}
@@ -653,6 +941,21 @@ class CommandLineTests(unittest.TestCase):
             )
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertIn("ZIZMOR_TAG", proc.stderr)
+
+    def test_imports_without_tomllib_so_python_310_can_use_github(self) -> None:
+        # tomllib arrived in Python 3.11. Only the PyPI fallback reads the
+        # lock, so a runner without it must still reach the GitHub path.
+        code = (
+            "import sys; sys.modules['tomllib'] = None; "
+            f"sys.path.insert(0, {str(SCRIPTS)!r}); import zizmor_fetch"
+        )
+        proc = subprocess.run(  # noqa: S603
+            [sys.executable, "-E", "-s", "-c", code],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_missing_configuration_exits_non_zero(self) -> None:
         proc = self.run_script()

@@ -10,6 +10,9 @@
 # at the pinned ref for the caller). It downloads the matching attested
 # zizmor release binary, verifies its Sigstore provenance, audits the
 # caller's already-checked-out workspace in SARIF mode, and summarises.
+# If GitHub's release CDN stays unavailable after bounded retries, it
+# falls back to the PyPI wheel pinned, with a SHA-256 digest, in the
+# bundled uv.lock.
 #
 # The caller is responsible for checking out the repository under audit
 # and for hardening the runner. SARIF upload is opt-in via upload-sarif;
@@ -127,66 +130,36 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
         TAG: ${{ steps.resolve.outputs.tag }}
+        ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
-        # Select the release asset for the runner platform. zizmor ships
-        # gnu and darwin tarballs for x86_64 and aarch64; other platforms
-        # (for example Windows) are not supported here.
-        case "${RUNNER_OS}:${RUNNER_ARCH}" in
-          Linux:X64)   asset='zizmor-x86_64-unknown-linux-gnu.tar.gz' ;;
-          Linux:ARM64) asset='zizmor-aarch64-unknown-linux-gnu.tar.gz' ;;
-          macOS:X64)   asset='zizmor-x86_64-apple-darwin.tar.gz' ;;
-          macOS:ARM64) asset='zizmor-aarch64-apple-darwin.tar.gz' ;;
-          *)
-            echo "error: unsupported runner ${RUNNER_OS}/${RUNNER_ARCH};" \
-                 "supports Linux and macOS on x86_64 or arm64" >&2
-            exit 1
-            ;;
-        esac
-        base='https://github.com/zizmorcore/zizmor/releases/download'
-        url="${base}/${TAG}/${asset}"
         # Work under a randomised temporary directory so nothing lands in
-        # the audited workspace. The tarball is removed after extraction;
-        # the whole directory is removed by the cleanup step.
+        # the audited workspace. The fetch script removes the downloaded
+        # archive; the cleanup step removes the whole directory.
         work="$(mktemp -d "${RUNNER_TEMP}/zizmor.XXXXXX")"
         echo "workdir=${work}" >> "$GITHUB_OUTPUT"
-        archive="${work}/${asset}"
-        bindir="${work}/bin"
-        mkdir -p "${bindir}"
-        # Retry transient network failures. The default --retry only
-        # covers a fixed set of HTTP responses and, with
-        # --retry-connrefused, refused connections; it does NOT retry a
-        # mid-transfer reset such as "Recv failure: Connection reset by
-        # peer" (curl exit 35/56), which the org-wide scan hit
-        # intermittently against the releases CDN.
-        #
-        # --retry-all-errors extends the retry logic to every error and
-        # supersedes --retry-connrefused, but it needs curl >= 7.71.0.
-        # GitHub-hosted runners ship a newer curl; a self-hosted runner
-        # might not, so probe for the flag (an unknown option makes curl
-        # exit non-zero before --version prints) and fall back to
-        # --retry-connrefused when it is absent. Omitting --retry-delay
-        # keeps curl's default exponential backoff between attempts, so a
-        # flaky endpoint no longer fails the whole run.
-        retry_opt='--retry-connrefused'
-        if curl --retry-all-errors --version >/dev/null 2>&1; then
-          retry_opt='--retry-all-errors'
-        fi
-        curl --fail --silent --show-error --location \
-          --retry 5 "${retry_opt}" \
-          --connect-timeout 10 --max-time 120 \
-          -o "${archive}" "${url}"
-        # Verify Sigstore provenance before trusting the binary.
-        gh attestation verify "${archive}" --repo zizmorcore/zizmor
-        tar -xzf "${archive}" -C "${bindir}"
-        rm -f "${archive}"
-        bin="$(find "${bindir}" -type f -name zizmor | head -n1)"
-        if [ -z "${bin}" ]; then
-          echo "error: zizmor binary not found in archive" >&2
+        # scripts/zizmor_fetch.py downloads the attested release tarball
+        # and verifies its Sigstore provenance, retrying transient
+        # failures (four retries, 180 seconds per source). If GitHub
+        # stays unavailable it falls back to the wheel that uv.lock pins
+        # on PyPI and checks the wheel's SHA-256 digest. The script
+        # selects the asset for the runner platform (Linux and macOS on
+        # x86_64 or arm64) and prints the outputs on stdout. python3 -E -s
+        # ignores PYTHONPATH and the user site, and never puts the audited
+        # workspace on sys.path; -I would also hide the script's sibling
+        # module.
+        fetched="$(
+          ZIZMOR_TAG="${TAG}" \
+          ZIZMOR_WORKDIR="${work}" \
+          ZIZMOR_LOCK="${ACTION_PATH}/uv.lock" \
+          python3 -E -s "${ACTION_PATH}/scripts/zizmor_fetch.py"
+        )"
+        printf '%s\n' "${fetched}" >> "$GITHUB_OUTPUT"
+        bin="$(printf '%s\n' "${fetched}" | sed -n 's/^zizmor=//p')"
+        if [ -z "${bin}" ] || [ ! -x "${bin}" ]; then
+          echo "error: zizmor binary not found after download" >&2
           exit 1
         fi
-        chmod +x "${bin}"
-        echo "zizmor=${bin}" >> "$GITHUB_OUTPUT"
         "${bin}" --version
 
     - name: 'Run zizmor (SARIF, advisory)'
