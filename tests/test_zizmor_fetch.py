@@ -28,6 +28,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import zipfile
 from pathlib import Path
 from types import ModuleType
@@ -157,6 +158,11 @@ def http_error(code: int) -> urllib.error.HTTPError:
     return urllib.error.HTTPError(
         "https://example.invalid/x", code, "status", email.message.Message(), None
     )
+
+
+def is_github(url: str) -> bool:
+    """Whether the URL's host is github.com, not merely mentions it."""
+    return urllib.parse.urlparse(url).hostname == "github.com"
 
 
 class RetryTests(unittest.TestCase):
@@ -723,7 +729,7 @@ class FetchTests(unittest.TestCase):
 
     def download(self, url: str, dest: Path, **_: Any) -> None:
         self.urls.append(url)
-        github = "github.com" in url
+        github = is_github(url)
         error = self.github_error if github else self.pypi_error
         if error is not None:
             raise error
@@ -829,7 +835,7 @@ class FetchTests(unittest.TestCase):
         seen: list[float] = []
 
         def slow(url: str, dest: Path, timeout: float = 0, **_: Any) -> None:
-            if "github.com" in url:
+            if is_github(url):
                 seen.append(timeout)
                 self.fake.now += min(100, timeout)
                 raise transfer().TransientError("HTTP 504")
@@ -856,7 +862,7 @@ class FetchTests(unittest.TestCase):
         self.verify_error = transfer().TransientError("HTTP 502")
         self.run_fetch()
         # One download, then four retried verifications, then the fallback.
-        github = [u for u in self.urls if "github.com" in u]
+        github = [u for u in self.urls if is_github(u)]
         self.assertEqual(len(github), 1)
         self.assertEqual(self.fake.sleeps, [10, 20, 40, 80])
 
