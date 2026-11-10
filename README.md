@@ -82,7 +82,9 @@ pushes.
 2. The action downloads the matching zizmor release binary from the
    [zizmorcore/zizmor releases](https://github.com/zizmorcore/zizmor/releases)
    and verifies its Sigstore provenance with `gh attestation verify`
-   before it runs. A binary that fails verification aborts the run.
+   before it runs. The action retries transient failures (see
+   [Download resilience](#download-resilience)). It never runs a binary
+   that fails verification.
 3. zizmor audits the workspace in SARIF mode.
 4. The action writes a findings summary to the job summary and, unless
    `annotate` is `'false'`, emits inline annotations.
@@ -176,11 +178,49 @@ The update flow:
 5. Consuming repositories bump their pinned ref (through their own
    Dependabot `github-actions` updates) to adopt the new zizmor version.
 
+## Download resilience
+
+A scheduled scan of an entire organisation downloads zizmor once per
+repository, so the download must survive a flaky release CDN. `scripts/zizmor_fetch.py`
+fetches the binary from two sources and stops at the first that yields a
+verified binary:
+
+1. **The attested GitHub release.** The script downloads the tarball and
+   checks its attestation with `gh attestation verify`.
+2. **The PyPI wheel pinned in `uv.lock`.** The wheel carries the same
+   binary. The script takes the wheel's URL and SHA-256 digest from the
+   bundled `uv.lock` and refuses a file that does not match.
+
+Each network operation, the download and the attestation check included,
+retries transient failures: HTTP 408, 425, 429 and 5xx responses,
+connection resets, timeouts and a response body cut short. It makes at
+most four retries, waiting about 10, 20, 40 and 80 seconds (each wait cut
+by up to a quarter at random, so parallel jobs do not retry in step).
+Each source also has a hard 180 second budget: every attempt receives
+the time that remains, so a stalled connection cannot delay the
+fallback past it. Failures retrying cannot fix, such as HTTP 404 or a
+digest mismatch, fail at once.
+
+The action logs a `::warning::` when it uses the PyPI wheel. That
+fallback checks a pinned digest but not the Sigstore attestation, so it
+proves the file matches what this action's `uv.lock` pinned, not who
+built it. The fallback needs `uv.lock` to pin the requested version: it
+does not apply when `zizmor-version` overrides the bundled pin. It also
+needs Python 3.11 or newer, for `tomllib`; the GitHub source works on any
+`python3` from 3.9, and the action names the missing version when a
+runner lacks it.
+
+`uv.lock` is the same file Dependabot already keeps current alongside
+`pyproject.toml`, so the fallback needs no extra maintenance.
+
 ## Security model
 
 - **Provenance verification.** Every run downloads the zizmor release
   binary and verifies its Sigstore attestation with
-  `gh attestation verify --repo zizmorcore/zizmor` before it runs.
+  `gh attestation verify --repo zizmorcore/zizmor` before it runs. When
+  GitHub stays unavailable the action instead uses the PyPI wheel pinned
+  by digest in `uv.lock`, and logs a warning. It never runs a binary that
+  matches neither check.
 - **Pinned and reviewable.** The ref a consumer pins fixes the installed
   zizmor version. Upgrades arrive as reviewable pull requests rather than
   tracking the latest release automatically.
