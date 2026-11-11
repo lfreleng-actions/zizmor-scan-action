@@ -182,14 +182,14 @@ The update flow:
 
 A scheduled scan of an entire organisation downloads zizmor once per
 repository, so the download must survive a flaky release CDN. `scripts/zizmor_fetch.py`
-fetches the binary from two sources and stops at the first that yields a
-verified binary:
+fetches the binary from two sources:
 
 1. **The attested GitHub release.** The script downloads the tarball and
    checks its attestation with `gh attestation verify`.
 2. **The PyPI wheel pinned in `uv.lock`.** The wheel carries the same
    binary. The script takes the wheel's URL and SHA-256 digest from the
-   bundled `uv.lock` and refuses a file that does not match.
+   bundled `uv.lock` and refuses a file that does not match. The script
+   turns to it when GitHub is unavailable, and never otherwise.
 
 Each network operation, the download and the attestation check included,
 retries transient failures: HTTP 408, 425, 429 and 5xx responses,
@@ -200,6 +200,26 @@ Each source also has a hard 180 second budget: every attempt receives
 the time that remains, so a stalled connection cannot delay the
 fallback past it. Failures retrying cannot fix, such as HTTP 404 or a
 digest mismatch, fail at once.
+
+GitHub counts as unavailable when the release download fails with one of
+those transient errors until the retries run out, when the release asset
+answers HTTP 404 or another client error, or when the attestation check
+fails with output that names an outage: a retryable HTTP status, or a
+network failure such as a timeout, a refused or reset connection, an
+unknown host, or a request whose connection dropped. Go's `unexpected
+EOF` names an outage when it follows the request's method and URL, and
+a verdict otherwise, because a decoder reading malformed attestation
+data says the same. When `gh` reports no cause beyond a Sigstore
+verifier that could not load its trust root, which invalid trust
+metadata causes as well as a blocked network, the script asks the
+Sigstore and GitHub trust root mirrors, and counts an outage when
+neither answers. A mirror whose TLS certificate fails validation is not
+an outage, and nor is a check with too little time left to ask both
+mirrors. Anything else is a verdict on the release, and the run fails
+without trying PyPI: a missing or rejected attestation, a runner without
+`gh`, or a tarball that is not readable or lacks the binary. The outage
+list is an allow-list, so an unrecognised `gh` message fails the run
+rather than skipping the check.
 
 The action logs a `::warning::` when it uses the PyPI wheel. That
 fallback checks a pinned digest but not the Sigstore attestation, so it
@@ -219,8 +239,9 @@ runner lacks it.
   binary and verifies its Sigstore attestation with
   `gh attestation verify --repo zizmorcore/zizmor` before it runs. When
   GitHub stays unavailable the action instead uses the PyPI wheel pinned
-  by digest in `uv.lock`, and logs a warning. It never runs a binary that
-  matches neither check.
+  by digest in `uv.lock`, and logs a warning. A missing or rejected
+  attestation fails the run instead of falling back. It never runs a
+  binary that matches neither check.
 - **Pinned and reviewable.** The ref a consumer pins fixes the installed
   zizmor version. Upgrades arrive as reviewable pull requests rather than
   tracking the latest release automatically.

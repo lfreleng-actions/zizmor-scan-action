@@ -3,8 +3,7 @@
 """Fetch the pinned zizmor binary, with bounded retries and a second source.
 
 The action runs this script instead of a bare ``curl`` so that one flaky
-CDN no longer fails a whole organisation-wide scan. It tries two sources
-in order and stops at the first that yields a verified binary:
+CDN no longer fails a whole organisation-wide scan. It has two sources:
 
 1. The attested GitHub release tarball. The script verifies its Sigstore
    provenance with ``gh attestation verify`` before it extracts anything.
@@ -12,6 +11,14 @@ in order and stops at the first that yields a verified binary:
    ``uv.lock`` pins the wheel URL and its SHA-256 digest, so the script
    refuses a wheel that does not match the pin. This is a hash pin, not
    Sigstore provenance, so the script reports when it was used.
+
+The script uses the PyPI wheel only when GitHub is unavailable: the
+release download or the attestation check keeps failing with an outage,
+or the release asset is not there to download. A verdict on the GitHub
+artifact fails the run instead, without trying PyPI: a missing or
+rejected attestation, a runner without ``gh``, or a tarball that is not
+readable or lacks the binary. Routing around a verdict would skip the
+provenance check that the GitHub source exists to make.
 
 Each network operation retries transient failures up to four times,
 waiting 10, 20, 40 and 80 seconds with each wait cut by up to a quarter
@@ -45,17 +52,20 @@ puts the audited workspace on the path.
 
 from __future__ import annotations
 
+import gzip
 import os
 import re
 import sys
 import tarfile
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
 from zizmor_transfer import (
     FetchError,
     RetrySchedule,
+    VerificationError,
     download_file,
     log,
     retry_call,
@@ -187,6 +197,9 @@ def extract_from_tarball(archive: Path, bindir: Path) -> Path:
     Read the member's bytes and write them under a fixed name rather
     than extracting by path, so an archive cannot place a file elsewhere.
     """
+    # gzip reports a damaged stream with errors tarfile does not wrap:
+    # EOFError when truncated, BadGzipFile on a bad checksum, zlib.error
+    # on an invalid deflate block inside a member.
     try:
         with tarfile.open(archive, "r:gz") as tar:
             for member in tar:
@@ -194,9 +207,11 @@ def extract_from_tarball(archive: Path, bindir: Path) -> Path:
                     handle = tar.extractfile(member)
                     if handle is not None:
                         return install(handle.read(), bindir)
-    except tarfile.TarError as exc:
-        raise FetchError(f"{archive.name} is not a readable tarball: {exc}") from exc
-    raise FetchError(f"{BINARY_NAME} binary not found in {archive.name}")
+    except (tarfile.TarError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
+        raise VerificationError(
+            f"{archive.name} is not a readable tarball: {exc}"
+        ) from exc
+    raise VerificationError(f"{BINARY_NAME} binary not found in {archive.name}")
 
 
 def extract_from_wheel(wheel: Path, version: str, bindir: Path) -> Path:
@@ -271,7 +286,7 @@ def fetch(
     lock_path: Path,
     schedule: RetrySchedule | None = None,
 ) -> FetchResult:
-    """Fetch zizmor from GitHub, or from PyPI when GitHub fails."""
+    """Fetch zizmor from GitHub, or from PyPI when GitHub is unavailable."""
     schedule = schedule or RetrySchedule()
     request = FetchRequest(tag, system, arch, workdir, lock_path)
     # Reject an unsupported runner before any network traffic.
@@ -279,9 +294,13 @@ def fetch(
     request.bindir.mkdir(parents=True, exist_ok=True)
     try:
         return FetchResult(fetch_from_github(request, schedule), "github")
+    except VerificationError as rejected:
+        raise VerificationError(
+            f"{rejected}; not falling back to the PyPI wheel"
+        ) from rejected
     except FetchError as github_failure:
         log(
-            "::warning::the attested GitHub release was unavailable "
+            "::warning::GitHub could not supply the attested release "
             f"({github_failure}); falling back to the PyPI wheel pinned "
             "in uv.lock. Its SHA-256 digest is checked, but its Sigstore "
             "attestation is not."

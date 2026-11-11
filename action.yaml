@@ -10,9 +10,9 @@
 # at the pinned ref for the caller). It downloads the matching attested
 # zizmor release binary, verifies its Sigstore provenance, audits the
 # caller's already-checked-out workspace in SARIF mode, and summarises.
-# If GitHub's release CDN stays unavailable after bounded retries, it
-# falls back to the PyPI wheel pinned, with a SHA-256 digest, in the
-# bundled uv.lock.
+# If GitHub stays unavailable after bounded retries, it falls back to
+# the PyPI wheel pinned, with a SHA-256 digest, in the bundled uv.lock.
+# A missing or rejected attestation fails the run instead.
 #
 # The caller is responsible for checking out the repository under audit
 # and for hardening the runner. SARIF upload is opt-in via upload-sarif;
@@ -142,7 +142,8 @@ runs:
         # and verifies its Sigstore provenance, retrying transient
         # failures (four retries, 180 seconds per source). If GitHub
         # stays unavailable it falls back to the wheel that uv.lock pins
-        # on PyPI and checks the wheel's SHA-256 digest. The script
+        # on PyPI and checks the wheel's SHA-256 digest; a missing or
+        # rejected attestation fails the step instead. The script
         # selects the asset for the runner platform (Linux and macOS on
         # x86_64 or arm64) and prints the outputs on stdout. python3 -E -s
         # ignores PYTHONPATH and the user site, and never puts the audited
