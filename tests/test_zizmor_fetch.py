@@ -21,6 +21,7 @@ import importlib.util
 import io
 import os
 import shutil
+import ssl
 import struct
 import subprocess
 import sys
@@ -597,11 +598,26 @@ class VerifyTests(unittest.TestCase):
         timeouts = [call.kwargs["timeout"] for call in run.call_args_list]
         self.assertEqual(timeouts, [25, mod.ATTESTATION_TIMEOUT])
 
-    def verify_failure(self, stderr: str, stdout: str = "") -> Exception:
-        """Run the check against a failed ``gh`` and return what it raised."""
+    def verify_failure(
+        self, stderr: str, stdout: str = "", mirrors_answer: Any = False
+    ) -> Exception:
+        """Run the check against a failed ``gh`` and return what it raised.
+
+        The trust root mirrors answer when ``mirrors_answer`` is set, and
+        are unreachable otherwise, as on a runner with the network down.
+        An exception is raised by the probe instead.
+        """
         mod = transfer()
         failed = subprocess.CompletedProcess([], 1, stdout=stdout, stderr=stderr)
-        with mock.patch.object(mod.subprocess, "run", return_value=failed):
+        probe = (
+            {"side_effect": mirrors_answer}
+            if isinstance(mirrors_answer, BaseException)
+            else {"return_value": mirrors_answer}
+        )
+        with (
+            mock.patch.object(mod.subprocess, "run", return_value=failed),
+            mock.patch.object(mod, "trust_root_answers", **probe) as self.probe,
+        ):
             with self.assertRaises(mod.FetchError) as caught:
                 mod.verify_attestation(Path("/tmp/archive.tar.gz"))
         return caught.exception
@@ -624,7 +640,9 @@ class VerifyTests(unittest.TestCase):
             "connect: Connection Refused",
             "lookup api.github.com: no such host",
             "net/http: TLS handshake timeout",
-            "unexpected EOF",
+            'Get "https://api.github.com/repos/zizmorcore/zizmor/attestations/'
+            'sha256:00": unexpected EOF',
+            'Error: Head "https://tuf-repo-cdn.sigstore.dev/": Unexpected EOF',
         ):
             with self.subTest(output=output):
                 error = self.verify_failure(output)
@@ -634,14 +652,73 @@ class VerifyTests(unittest.TestCase):
         error = self.verify_failure("", stdout=OUTAGE_OUTPUT)
         self.assertIsInstance(error, transfer().TransientError)
 
-    @unittest.expectedFailure
+    def test_an_unloaded_trust_root_is_an_outage_when_no_mirror_answers(
+        self,
+    ) -> None:
+        error = self.verify_failure(OUTAGE_OUTPUT)
+        self.assertIsInstance(error, transfer().TransientError)
+        probed = [call.args[0] for call in self.probe.call_args_list]
+        self.assertEqual(probed, list(transfer().TRUST_ROOT_MIRRORS))
+
+    def test_an_unloaded_trust_root_is_a_verdict_when_a_mirror_answers(
+        self,
+    ) -> None:
+        # Invalid trust metadata stops both verifiers just as a blocked
+        # network does; a mirror that answers rules the network out.
+        error = self.verify_failure(OUTAGE_OUTPUT, mirrors_answer=True)
+        self.assertIsInstance(error, transfer().VerificationError)
+        self.assertNotIsInstance(error, transfer().TransientError)
+        self.assertIn("no valid Sigstore verifiers", str(error))
+        self.assertIn("answered, so this is not an outage", str(error))
+
+    def test_an_unloaded_trust_root_is_a_verdict_without_time_to_probe(
+        self,
+    ) -> None:
+        mod = transfer()
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr=OUTAGE_OUTPUT)
+        with (
+            mock.patch.object(mod.subprocess, "run", return_value=failed),
+            mock.patch.object(mod, "trust_root_answers") as probe,
+        ):
+            with self.assertRaises(mod.FetchError) as caught:
+                mod.verify_attestation(Path("/tmp/archive.tar.gz"), timeout=0.5)
+        probe.assert_not_called()
+        self.assertIsInstance(caught.exception, mod.VerificationError)
+        self.assertNotIsInstance(caught.exception, mod.TransientError)
+        self.assertIn("could not be established", str(caught.exception))
+        self.assertNotIn("answered", str(caught.exception))
+
+    def test_an_unloaded_trust_root_is_a_verdict_when_a_mirror_is_untrusted(
+        self,
+    ) -> None:
+        mod = transfer()
+        error = self.verify_failure(
+            OUTAGE_OUTPUT,
+            mirrors_answer=mod.VerificationError(
+                "trust root mirror https://tuf.example/ failed TLS "
+                "certificate validation"
+            ),
+        )
+        self.assertIsInstance(error, mod.VerificationError)
+        self.assertNotIsInstance(error, mod.TransientError)
+        self.assertIn("archive.tar.gz", str(error))
+        self.assertIn("certificate validation", str(error))
+
+    def test_network_evidence_needs_no_probe(self) -> None:
+        error = self.verify_failure(
+            'Get "https://tuf-repo-cdn.sigstore.dev/": dial tcp: i/o timeout\n'
+            + OUTAGE_OUTPUT,
+            mirrors_answer=True,
+        )
+        self.assertIsInstance(error, transfer().TransientError)
+        self.probe.assert_not_called()
+
     def test_a_missing_attestation_is_a_verdict(self) -> None:
         error = self.verify_failure(MISSING_ATTESTATION_OUTPUT)
         self.assertIsInstance(error, transfer().VerificationError)
         self.assertNotIsInstance(error, transfer().TransientError)
         self.assertIn("HTTP 404", str(error))
 
-    @unittest.expectedFailure
     def test_unrecognised_output_is_a_verdict(self) -> None:
         error = self.verify_failure(
             'Error: verifying with issuer "sigstore.dev": no matching attestation'
@@ -649,7 +726,20 @@ class VerifyTests(unittest.TestCase):
         self.assertIsInstance(error, transfer().VerificationError)
         self.assertNotIsInstance(error, transfer().TransientError)
 
-    @unittest.expectedFailure
+    def test_a_bare_unexpected_eof_is_a_verdict(self) -> None:
+        # Go decoders say "unexpected EOF" for truncated or malformed
+        # material that arrived intact; only the HTTP client's form, with
+        # the method and URL, names a dropped connection.
+        for output in (
+            "unexpected EOF",
+            "Error: failed to unmarshal the attestation bundle: unexpected EOF",
+            "Error: decoding https://api.github.com/attestations: unexpected EOF",
+        ):
+            with self.subTest(output=output):
+                error = self.verify_failure(output, mirrors_answer=True)
+                self.assertIsInstance(error, transfer().VerificationError)
+                self.assertNotIsInstance(error, transfer().TransientError)
+
     def test_empty_output_is_a_verdict(self) -> None:
         error = self.verify_failure("")
         self.assertIsInstance(error, transfer().VerificationError)
@@ -665,7 +755,6 @@ class VerifyTests(unittest.TestCase):
             with self.assertRaises(mod.TransientError):
                 mod.verify_attestation(Path("/tmp/archive.tar.gz"))
 
-    @unittest.expectedFailure
     def test_missing_gh_is_a_verification_failure(self) -> None:
         mod = transfer()
         with mock.patch.object(mod.subprocess, "run", side_effect=FileNotFoundError):
@@ -673,6 +762,115 @@ class VerifyTests(unittest.TestCase):
                 mod.verify_attestation(Path("/tmp/archive.tar.gz"))
         self.assertIsInstance(caught.exception, mod.VerificationError)
         self.assertNotIsInstance(caught.exception, mod.TransientError)
+
+
+class TrustRootProbeTests(unittest.TestCase):
+    def answers(self, outcome: Any) -> bool:
+        mod = transfer()
+        kwargs = (
+            {"side_effect": outcome}
+            if isinstance(outcome, BaseException)
+            else {"return_value": outcome}
+        )
+        with mock.patch.object(mod.urllib.request, "urlopen", **kwargs):
+            return bool(mod.trust_root_answers("https://tuf.example/", 5))
+
+    def test_any_response_means_the_mirror_answers(self) -> None:
+        self.assertTrue(self.answers(FakeResponse([])))
+        for code in (403, 404, 405):
+            with self.subTest(code=code):
+                self.assertTrue(self.answers(http_error(code)))
+
+    def test_network_failures_and_retryable_statuses_do_not_answer(self) -> None:
+        for outcome in (
+            http_error(503),
+            http_error(429),
+            urllib.error.URLError("no such host"),
+            ConnectionRefusedError(),
+            TimeoutError(),
+        ):
+            with self.subTest(outcome=outcome):
+                self.assertFalse(self.answers(outcome))
+
+    def test_a_certificate_failure_is_a_verification_failure(self) -> None:
+        mod = transfer()
+        bad = ssl.SSLCertVerificationError(
+            1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"
+        )
+        for outcome in (urllib.error.URLError(bad), bad):
+            with self.subTest(outcome=outcome):
+                with self.assertRaises(mod.FetchError) as caught:
+                    self.answers(outcome)
+                self.assertIsInstance(caught.exception, mod.VerificationError)
+                self.assertNotIsInstance(caught.exception, mod.TransientError)
+                self.assertIn("certificate validation", str(caught.exception))
+
+    def test_other_tls_failures_do_not_answer(self) -> None:
+        self.assertFalse(
+            self.answers(urllib.error.URLError(ssl.SSLError(1, "handshake failure")))
+        )
+
+    def test_an_untrusted_mirror_stops_the_probe(
+        self,
+    ) -> None:
+        mod = transfer()
+        bad = urllib.error.URLError(
+            ssl.SSLCertVerificationError(1, "certificate verify failed")
+        )
+        with mock.patch.object(mod.urllib.request, "urlopen", side_effect=bad):
+            with self.assertRaises(mod.VerificationError):
+                mod.trust_root_outage_doubt(30)
+
+    def probe(
+        self, answers: list[bool], timeout: float = 30, cost: float = 0
+    ) -> tuple[str | None, Any]:
+        """Run the probe; each mirror asked takes ``cost`` seconds."""
+        mod = transfer()
+        now = [0.0]
+
+        def ask(url: str, timeout: float) -> bool:
+            now[0] += cost
+            return answers.pop(0)
+
+        with (
+            mock.patch.object(mod.time, "monotonic", side_effect=lambda: now[0]),
+            mock.patch.object(mod, "trust_root_answers", side_effect=ask) as probe,
+        ):
+            doubt = mod.trust_root_outage_doubt(timeout)
+        return doubt, probe
+
+    def test_an_outage_only_when_no_mirror_answers(self) -> None:
+        doubt, probe = self.probe([False, False])
+        self.assertIsNone(doubt)
+        self.assertEqual(probe.call_count, 2)
+        self.assertTrue(
+            all(
+                call.args[1] <= transfer().PROBE_TIMEOUT
+                for call in probe.call_args_list
+            )
+        )
+
+    def test_one_answering_mirror_is_enough(self) -> None:
+        mirrors = transfer().TRUST_ROOT_MIRRORS
+        for answers, mirror in (([True], mirrors[0]), ([False, True], mirrors[1])):
+            with self.subTest(answers=answers):
+                doubt, _ = self.probe(answers)
+                self.assertIsNotNone(doubt)
+                self.assertIn(f"{mirror} answered", str(doubt))
+
+    def test_no_time_left_is_no_evidence_of_an_outage(self) -> None:
+        doubt, probe = self.probe([], timeout=0.5)
+        probe.assert_not_called()
+        self.assertIn("could not be established", str(doubt))
+        self.assertNotIn("answered", str(doubt))
+
+    def test_a_probe_that_spends_the_time_left_claims_no_answer(self) -> None:
+        mirrors = transfer().TRUST_ROOT_MIRRORS
+        doubt, probe = self.probe([False], timeout=10, cost=9.5)
+        self.assertEqual(probe.call_count, 1)
+        self.assertIn(f"ask trust root mirror {mirrors[1]}", str(doubt))
+        self.assertIn("could not be established", str(doubt))
+        self.assertNotIn("answered", str(doubt))
 
 
 class AssetTests(unittest.TestCase):
@@ -789,7 +987,6 @@ class ExtractTests(unittest.TestCase):
         with self.assertRaises(mod.FetchError):
             mod.extract_from_tarball(archive, self.bindir)
 
-    @unittest.expectedFailure
     def test_a_damaged_gzip_stream_is_a_verification_failure(self) -> None:
         mod = load()
         archive = self.root / "release.tar.gz"
@@ -847,6 +1044,9 @@ class FetchTests(unittest.TestCase):
         # When set, the real attestation check runs against a fake gh
         # that returns this result or raises this exception.
         self.gh: subprocess.CompletedProcess[str] | Exception | None = None
+        # Whether the Sigstore trust root mirrors answer the fake gh's
+        # outage probe, or the exception the probe raises.
+        self.mirrors_answer: bool | Exception = False
         self.stderr = io.StringIO()
 
     def download(self, url: str, dest: Path, **_: Any) -> None:
@@ -867,7 +1067,15 @@ class FetchTests(unittest.TestCase):
                 if isinstance(self.gh, Exception)
                 else {"return_value": self.gh}
             )
-            with mock.patch.object(mod.subprocess, "run", **gh):
+            probe = (
+                {"side_effect": self.mirrors_answer}
+                if isinstance(self.mirrors_answer, BaseException)
+                else {"return_value": self.mirrors_answer}
+            )
+            with (
+                mock.patch.object(mod.subprocess, "run", **gh),
+                mock.patch.object(mod, "trust_root_answers", **probe),
+            ):
                 mod.verify_attestation(archive, **kwargs)
 
     def gh_fails(self, output: str) -> None:
@@ -1020,34 +1228,50 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(self.fake.sleeps, [10, 20, 40, 80])
         self.assertEqual(list(self.work.rglob("*.tar.gz")), [])
 
-    @unittest.expectedFailure
+    def test_an_unloaded_trust_root_with_the_mirrors_up_fails_closed(
+        self,
+    ) -> None:
+        self.gh_fails(OUTAGE_OUTPUT)
+        self.mirrors_answer = True
+        self.assert_failed_closed()
+
+    def test_untrusted_trust_root_mirrors_fail_closed(self) -> None:
+        self.gh_fails(OUTAGE_OUTPUT)
+        self.mirrors_answer = transfer().VerificationError(
+            "trust root mirror https://tuf.example/ failed TLS certificate validation"
+        )
+        error = self.assert_failed_closed()
+        self.assertIn("certificate validation", str(error))
+
     def test_a_missing_attestation_fails_closed(self) -> None:
         self.gh_fails(MISSING_ATTESTATION_OUTPUT)
         error = self.assert_failed_closed()
         self.assertIn("zizmor-x86_64-unknown-linux-gnu.tar.gz", str(error))
         self.assertIn("HTTP 404", str(error))
 
-    @unittest.expectedFailure
+    def test_a_decoding_eof_fails_closed(self) -> None:
+        self.gh_fails(
+            "Error: failed to unmarshal the attestation bundle: unexpected EOF"
+        )
+        error = self.assert_failed_closed()
+        self.assertIn("unexpected EOF", str(error))
+
     def test_a_rejected_attestation_fails_closed(self) -> None:
         self.gh_fails("Error: verifying with issuer: no matching attestation")
         self.assert_failed_closed()
 
-    @unittest.expectedFailure
     def test_a_missing_gh_fails_closed(self) -> None:
         self.gh = FileNotFoundError("gh")
         self.assert_failed_closed()
 
-    @unittest.expectedFailure
     def test_an_unreadable_tarball_fails_closed(self) -> None:
         self.tarball = b"not a tarball"
         self.assert_failed_closed()
 
-    @unittest.expectedFailure
     def test_a_truncated_gzip_stream_fails_closed(self) -> None:
         self.tarball = make_tarball()[:5]
         self.assert_failed_closed()
 
-    @unittest.expectedFailure
     def test_a_tarball_without_the_binary_fails_closed(self) -> None:
         buffer = io.BytesIO()
         with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
