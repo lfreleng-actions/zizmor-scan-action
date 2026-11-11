@@ -13,6 +13,7 @@ import __future__
 
 import contextlib
 import email.message
+import gzip
 import hashlib
 import http.client
 import http.server
@@ -20,6 +21,7 @@ import importlib.util
 import io
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -42,6 +44,19 @@ VERSION = "1.31.1"
 TAG = f"v{VERSION}"
 PRIMARY_BINARY = b"#!/bin/sh\necho primary\n"
 FALLBACK_BINARY = b"#!/bin/sh\necho fallback\n"
+
+# What gh 2.102.0 prints when the attestations API has no attestation for
+# the archive's digest, and when it cannot reach the Sigstore trust root.
+MISSING_ATTESTATION_OUTPUT = (
+    "Loaded digest sha256:0123 for file:///tmp/archive.tar.gz\n"
+    "✗ Loading attestations from GitHub API failed\n\n"
+    "Error: HTTP 404: Not Found (https://api.github.com/repos/zizmorcore/"
+    "zizmor/attestations/sha256:0123?per_page=30&predicate_type=)\n"
+)
+OUTAGE_OUTPUT = (
+    "error creating Sigstore verifier: "
+    "no valid Sigstore verifiers could be initialized\n"
+)
 
 
 def load_module(name: str) -> ModuleType:
@@ -106,6 +121,47 @@ def make_tarball(content: bytes = PRIMARY_BINARY) -> bytes:
         info.mode = 0o644
         tar.addfile(info, io.BytesIO(content))
     return buffer.getvalue()
+
+
+GZIP_HEADER = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff"
+
+
+def stored_deflate(data: bytes) -> bytes:
+    """Encode ``data`` as non-final stored deflate blocks.
+
+    Stored blocks keep the compressed bytes independent of the zlib
+    build, so a test can place a fault at a known offset in the stream.
+    """
+    blocks = b""
+    for start in range(0, len(data), 0xFFFF):
+        chunk = data[start : start + 0xFFFF]
+        size = len(chunk)
+        blocks += b"\x00" + struct.pack("<HH", size, size ^ 0xFFFF) + chunk
+    return blocks
+
+
+def broken_tarballs() -> dict[str, bytes]:
+    """Damaged gzip streams that ``tarfile.TarError`` alone does not cover.
+
+    A truncated stream raises ``EOFError``, a bad trailer checksum
+    ``gzip.BadGzipFile`` and an invalid deflate block inside the member
+    ``zlib.error``.
+    """
+    small = tarfile.TarInfo("zizmor")
+    small.size = 4096
+    stream = gzip.compress(small.tobuf(), mtime=0)
+    bad_crc = bytearray(stream)
+    bad_crc[-8] ^= 0xFF
+    # The fault sits past what gzip reads ahead while tarfile opens the
+    # archive, so it surfaces when the member is read.
+    large = tarfile.TarInfo("zizmor")
+    large.size = 1 << 21
+    body = stored_deflate(large.tobuf() + bytes(1 << 20))
+    return {
+        "truncated": stream[:5],
+        "bad checksum": bytes(bad_crc),
+        "invalid deflate block": GZIP_HEADER + body + b"\x07",
+    }
 
 
 def make_wheel(content: bytes = FALLBACK_BINARY, version: str = VERSION) -> bytes:
@@ -541,13 +597,63 @@ class VerifyTests(unittest.TestCase):
         timeouts = [call.kwargs["timeout"] for call in run.call_args_list]
         self.assertEqual(timeouts, [25, mod.ATTESTATION_TIMEOUT])
 
-    def test_failure_is_transient_so_it_is_retried(self) -> None:
+    def verify_failure(self, stderr: str, stdout: str = "") -> Exception:
+        """Run the check against a failed ``gh`` and return what it raised."""
         mod = transfer()
-        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="HTTP 502")
+        failed = subprocess.CompletedProcess([], 1, stdout=stdout, stderr=stderr)
         with mock.patch.object(mod.subprocess, "run", return_value=failed):
-            with self.assertRaises(mod.TransientError) as caught:
+            with self.assertRaises(mod.FetchError) as caught:
                 mod.verify_attestation(Path("/tmp/archive.tar.gz"))
-        self.assertIn("HTTP 502", str(caught.exception))
+        return caught.exception
+
+    def test_a_gateway_error_is_transient_so_it_is_retried(self) -> None:
+        error = self.verify_failure("HTTP 502")
+        self.assertIsInstance(error, transfer().TransientError)
+        self.assertIn("HTTP 502", str(error))
+
+    def test_outage_signatures_are_transient(self) -> None:
+        for output in (
+            OUTAGE_OUTPUT,
+            "Error: HTTP 408: Request Timeout",
+            "Error: HTTP 425: Too Early",
+            "Error: http 429: Too Many Requests",
+            "Error: HTTP 503: Service Unavailable",
+            "Error: HTTP 524",
+            'Get "https://api.github.com/": dial tcp: i/o timeout',
+            "read tcp 10.0.0.1:443: connection reset by peer",
+            "connect: Connection Refused",
+            "lookup api.github.com: no such host",
+            "net/http: TLS handshake timeout",
+            "unexpected EOF",
+        ):
+            with self.subTest(output=output):
+                error = self.verify_failure(output)
+                self.assertIsInstance(error, transfer().TransientError)
+
+    def test_an_outage_signature_on_stdout_is_transient(self) -> None:
+        error = self.verify_failure("", stdout=OUTAGE_OUTPUT)
+        self.assertIsInstance(error, transfer().TransientError)
+
+    @unittest.expectedFailure
+    def test_a_missing_attestation_is_a_verdict(self) -> None:
+        error = self.verify_failure(MISSING_ATTESTATION_OUTPUT)
+        self.assertIsInstance(error, transfer().VerificationError)
+        self.assertNotIsInstance(error, transfer().TransientError)
+        self.assertIn("HTTP 404", str(error))
+
+    @unittest.expectedFailure
+    def test_unrecognised_output_is_a_verdict(self) -> None:
+        error = self.verify_failure(
+            'Error: verifying with issuer "sigstore.dev": no matching attestation'
+        )
+        self.assertIsInstance(error, transfer().VerificationError)
+        self.assertNotIsInstance(error, transfer().TransientError)
+
+    @unittest.expectedFailure
+    def test_empty_output_is_a_verdict(self) -> None:
+        error = self.verify_failure("")
+        self.assertIsInstance(error, transfer().VerificationError)
+        self.assertNotIsInstance(error, transfer().TransientError)
 
     def test_timeout_is_transient(self) -> None:
         mod = transfer()
@@ -559,11 +665,13 @@ class VerifyTests(unittest.TestCase):
             with self.assertRaises(mod.TransientError):
                 mod.verify_attestation(Path("/tmp/archive.tar.gz"))
 
-    def test_missing_gh_is_permanent(self) -> None:
+    @unittest.expectedFailure
+    def test_missing_gh_is_a_verification_failure(self) -> None:
         mod = transfer()
         with mock.patch.object(mod.subprocess, "run", side_effect=FileNotFoundError):
             with self.assertRaises(mod.FetchError) as caught:
                 mod.verify_attestation(Path("/tmp/archive.tar.gz"))
+        self.assertIsInstance(caught.exception, mod.VerificationError)
         self.assertNotIsInstance(caught.exception, mod.TransientError)
 
 
@@ -681,6 +789,17 @@ class ExtractTests(unittest.TestCase):
         with self.assertRaises(mod.FetchError):
             mod.extract_from_tarball(archive, self.bindir)
 
+    @unittest.expectedFailure
+    def test_a_damaged_gzip_stream_is_a_verification_failure(self) -> None:
+        mod = load()
+        archive = self.root / "release.tar.gz"
+        for name, content in broken_tarballs().items():
+            with self.subTest(name):
+                archive.write_bytes(content)
+                with self.assertRaises(transfer().VerificationError) as caught:
+                    mod.extract_from_tarball(archive, self.bindir)
+                self.assertIn("not a readable tarball", str(caught.exception))
+
     def test_extracts_an_executable_from_a_wheel(self) -> None:
         mod = load()
         wheel = self.root / "zizmor.whl"
@@ -725,6 +844,9 @@ class FetchTests(unittest.TestCase):
         self.github_error: Exception | None = None
         self.pypi_error: Exception | None = None
         self.verify_error: Exception | None = None
+        # When set, the real attestation check runs against a fake gh
+        # that returns this result or raises this exception.
+        self.gh: subprocess.CompletedProcess[str] | Exception | None = None
         self.stderr = io.StringIO()
 
     def download(self, url: str, dest: Path, **_: Any) -> None:
@@ -735,9 +857,34 @@ class FetchTests(unittest.TestCase):
             raise error
         dest.write_bytes(self.tarball if github else self.wheel)
 
-    def verify(self, archive: Path, **_: Any) -> None:
+    def verify(self, archive: Path, **kwargs: Any) -> None:
         if self.verify_error is not None:
             raise self.verify_error
+        if self.gh is not None:
+            mod = transfer()
+            gh = (
+                {"side_effect": self.gh}
+                if isinstance(self.gh, Exception)
+                else {"return_value": self.gh}
+            )
+            with mock.patch.object(mod.subprocess, "run", **gh):
+                mod.verify_attestation(archive, **kwargs)
+
+    def gh_fails(self, output: str) -> None:
+        self.gh = subprocess.CompletedProcess([], 1, stdout="", stderr=output)
+
+    def assert_failed_closed(self) -> Exception:
+        """Fetch, and check it failed without retrying or trying PyPI."""
+        with self.assertRaises(transfer().FetchError) as caught:
+            self.run_fetch()
+        self.assertIsInstance(caught.exception, transfer().VerificationError)
+        self.assertEqual([u for u in self.urls if not is_github(u)], [])
+        self.assertEqual(self.fake.sleeps, [])
+        self.assertEqual(list(self.work.rglob("*.tar.gz")), [])
+        self.assertEqual(list(self.work.rglob("zizmor")), [])
+        self.assertNotIn("::warning::", self.stderr.getvalue())
+        self.assertIn("not falling back", str(caught.exception))
+        return caught.exception
 
     def run_fetch(self, tag: str = TAG) -> Any:
         schedule = self.fake.schedule()
@@ -865,6 +1012,50 @@ class FetchTests(unittest.TestCase):
         github = [u for u in self.urls if is_github(u)]
         self.assertEqual(len(github), 1)
         self.assertEqual(self.fake.sleeps, [10, 20, 40, 80])
+
+    def test_an_attestation_check_outage_still_falls_back(self) -> None:
+        self.gh_fails(OUTAGE_OUTPUT)
+        result = self.run_fetch()
+        self.assertEqual(result.source, "pypi")
+        self.assertEqual(self.fake.sleeps, [10, 20, 40, 80])
+        self.assertEqual(list(self.work.rglob("*.tar.gz")), [])
+
+    @unittest.expectedFailure
+    def test_a_missing_attestation_fails_closed(self) -> None:
+        self.gh_fails(MISSING_ATTESTATION_OUTPUT)
+        error = self.assert_failed_closed()
+        self.assertIn("zizmor-x86_64-unknown-linux-gnu.tar.gz", str(error))
+        self.assertIn("HTTP 404", str(error))
+
+    @unittest.expectedFailure
+    def test_a_rejected_attestation_fails_closed(self) -> None:
+        self.gh_fails("Error: verifying with issuer: no matching attestation")
+        self.assert_failed_closed()
+
+    @unittest.expectedFailure
+    def test_a_missing_gh_fails_closed(self) -> None:
+        self.gh = FileNotFoundError("gh")
+        self.assert_failed_closed()
+
+    @unittest.expectedFailure
+    def test_an_unreadable_tarball_fails_closed(self) -> None:
+        self.tarball = b"not a tarball"
+        self.assert_failed_closed()
+
+    @unittest.expectedFailure
+    def test_a_truncated_gzip_stream_fails_closed(self) -> None:
+        self.tarball = make_tarball()[:5]
+        self.assert_failed_closed()
+
+    @unittest.expectedFailure
+    def test_a_tarball_without_the_binary_fails_closed(self) -> None:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+            info = tarfile.TarInfo("README")
+            info.size = 0
+            tar.addfile(info, io.BytesIO(b""))
+        self.tarball = buffer.getvalue()
+        self.assert_failed_closed()
 
 
 def python39() -> str | None:
