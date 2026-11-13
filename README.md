@@ -79,16 +79,21 @@ pushes.
    action reads its pinned zizmor version from its bundled
    `pyproject.toml` through `${{ github.action_path }}`, so that ref
    fixes the zizmor version: the ref is the pin.
-2. The action downloads the matching zizmor release binary from the
+2. The action sets up Python 3.13 with a commit-pinned
+   `actions/setup-python` and runs its own scripts on that interpreter,
+   not on whichever `python3` comes first on the caller's `PATH`. It
+   passes `update-environment: false`, so the caller's `PATH` and
+   environment stay as they were.
+3. The action downloads the matching zizmor release binary from the
    [zizmorcore/zizmor releases](https://github.com/zizmorcore/zizmor/releases)
    and verifies its Sigstore provenance with `gh attestation verify`
    before it runs. The action retries transient failures (see
    [Download resilience](#download-resilience)). It never runs a binary
    that fails verification.
-3. zizmor audits the workspace in SARIF mode.
-4. The action writes a findings summary to the job summary and, unless
+4. zizmor audits the workspace in SARIF mode.
+5. The action writes a findings summary to the job summary and, unless
    `annotate` is `'false'`, emits inline annotations.
-5. When `upload-sarif` is `'true'`, the action publishes the SARIF to
+6. When `upload-sarif` is `'true'`, the action publishes the SARIF to
    code scanning. The example workflows set this for default-branch
    pushes and keep pull request runs advisory.
 
@@ -226,9 +231,8 @@ fallback checks a pinned digest but not the Sigstore attestation, so it
 proves the file matches what this action's `uv.lock` pinned, not who
 built it. The fallback needs `uv.lock` to pin the requested version: it
 does not apply when `zizmor-version` overrides the bundled pin. It also
-needs Python 3.11 or newer, for `tomllib`; the GitHub source works on any
-`python3` from 3.9, and the action names the missing version when a
-runner lacks it.
+needs Python 3.11 or newer, for `tomllib`; the Python 3.13 the action
+sets up meets that.
 
 `uv.lock` is the same file Dependabot already keeps current alongside
 `pyproject.toml`, so the fallback needs no extra maintenance.
