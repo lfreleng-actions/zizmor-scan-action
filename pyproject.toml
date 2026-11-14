@@ -59,8 +59,8 @@ ignore = [
 "tests/**/*.py" = ["S101", "ARG", "PLR0913", "PLR0917", "PLR2004"]
 
 [tool.basedpyright]
-# The summary script runs on the runner's system python3, not under
-# requires-python above. Python 3.10 is end of life, so type-check
+# The action runs its scripts on the Python that actions/setup-python
+# sets up in action.yaml, not under requires-python above. Type-check
 # against 3.11, the floor requires-python sets.
 pythonVersion = "3.11"
 pythonPlatform = "All"

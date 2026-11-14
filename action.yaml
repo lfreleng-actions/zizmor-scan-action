@@ -100,6 +100,19 @@ runs:
             ;;
         esac
 
+    # Resolve the interpreter the later steps run, instead of whichever
+    # python3 comes first on the caller's PATH. The explicit version
+    # stops setup-python reading a .python-version from the audited
+    # workspace, and update-environment: false leaves the caller's
+    # PATH and environment untouched for the rest of its job.
+    - name: 'Set up Python'
+      id: 'python'
+      # yamllint disable-line rule:line-length
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+      with:
+        python-version: '3.13'
+        update-environment: false
+
     - name: 'Resolve zizmor version'
       id: 'resolve'
       shell: 'bash'
@@ -131,6 +144,7 @@ runs:
         GH_TOKEN: ${{ github.token }}
         TAG: ${{ steps.resolve.outputs.tag }}
         ACTION_PATH: ${{ github.action_path }}
+        PYTHON: ${{ steps.python.outputs.python-path }}
       run: |
         set -euo pipefail
         # Work under a randomised temporary directory so nothing lands in
@@ -145,15 +159,15 @@ runs:
         # on PyPI and checks the wheel's SHA-256 digest; a missing or
         # rejected attestation fails the step instead. The script
         # selects the asset for the runner platform (Linux and macOS on
-        # x86_64 or arm64) and prints the outputs on stdout. python3 -E -s
-        # ignores PYTHONPATH and the user site, and never puts the audited
+        # x86_64 or arm64) and prints the outputs on stdout. -E -s ignores
+        # PYTHONPATH and the user site, and never puts the audited
         # workspace on sys.path; -I would also hide the script's sibling
         # module.
         fetched="$(
           ZIZMOR_TAG="${TAG}" \
           ZIZMOR_WORKDIR="${work}" \
           ZIZMOR_LOCK="${ACTION_PATH}/uv.lock" \
-          python3 -E -s "${ACTION_PATH}/scripts/zizmor_fetch.py"
+          "${PYTHON}" -E -s "${ACTION_PATH}/scripts/zizmor_fetch.py"
         )"
         printf '%s\n' "${fetched}" >> "$GITHUB_OUTPUT"
         bin="$(printf '%s\n' "${fetched}" | sed -n 's/^zizmor=//p')"
@@ -175,6 +189,7 @@ runs:
         WORKDIR: ${{ inputs.working-directory }}
         ZIZMOR_BIN: ${{ steps.download.outputs.zizmor }}
         RESOLVED_TAG: ${{ steps.resolve.outputs.tag }}
+        PYTHON: ${{ steps.python.outputs.python-path }}
       run: |
         set -euo pipefail
         sarif="${GITHUB_WORKSPACE}/zizmor.sarif"
@@ -211,7 +226,7 @@ runs:
           echo "::notice::zizmor collected no auditable inputs;" \
             "reporting a clean (empty) result"
           ver="${RESOLVED_TAG#v}"
-          # python3 is already required by this step, so synthesise the
+          # Python is already required by this step, so synthesise the
           # empty SARIF with it rather than adding a jq dependency.
           # The heredoc body and its PY terminator are written at this
           # run block's base indent. YAML strips that indent before bash
@@ -223,7 +238,7 @@ runs:
           # top-level or a bracket continuation, so none needs indenting.
           # -I keeps the working directory (the audited workspace) off
           # sys.path, so json is the standard library module.
-          python3 -I - "${ver}" > "${tmp}" <<'PY'
+          "${PYTHON}" -I - "${ver}" > "${tmp}" <<'PY'
         import json, sys
         v = sys.argv[1]
         schema = ("https://docs.oasis-open.org/sarif/sarif/v2.1.0/"
@@ -245,7 +260,8 @@ runs:
           echo "::error::zizmor exited with code ${rc}" >&2
           exit "${rc}"
         fi
-        python3 -I -c 'import json,sys; json.load(open(sys.argv[1]))' "${tmp}"
+        "${PYTHON}" -I -c 'import json,sys; json.load(open(sys.argv[1]))' \
+          "${tmp}"
         mv "${tmp}" "${sarif}"
         echo "sarif=${sarif}" >> "$GITHUB_OUTPUT"
         bytes=$(wc -c < "${sarif}" | tr -d ' ')
@@ -263,9 +279,10 @@ runs:
         ZIZMOR_SHA: ${{ inputs.summary-sha }}
         ZIZMOR_ANNOTATE: ${{ inputs.annotate }}
         ACTION_PATH: ${{ github.action_path }}
+        PYTHON: ${{ steps.python.outputs.python-path }}
       run: |
         set -euo pipefail
-        python3 -I "${ACTION_PATH}/scripts/zizmor_summary.py"
+        "${PYTHON}" -I "${ACTION_PATH}/scripts/zizmor_summary.py"
 
     - name: 'Upload SARIF to code scanning'
       if: >-
