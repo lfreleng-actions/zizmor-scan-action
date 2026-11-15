@@ -40,9 +40,7 @@ On success the script prints ``zizmor=<path>`` and ``source=<github|pypi>``
 to stdout, ready to append to ``$GITHUB_OUTPUT``. Everything else goes to
 stderr.
 
-The GitHub source needs only the standard library of Python 3.9 or
-newer. The PyPI fallback reads ``uv.lock`` with ``tomllib``, which needs
-3.11, and reports that when it is missing.
+The script needs only the standard library of Python 3.11 or newer.
 
 Run it as ``python3 -E -s zizmor_fetch.py``: ``-I`` would also drop the
 script's own directory from ``sys.path`` and hide its sibling module,
@@ -50,13 +48,12 @@ while ``-E -s`` still ignores ``PYTHONPATH`` and the user site, and never
 puts the audited workspace on the path.
 """
 
-from __future__ import annotations
-
 import gzip
 import os
 import re
 import sys
 import tarfile
+import tomllib
 import zipfile
 import zlib
 from dataclasses import dataclass
@@ -144,15 +141,6 @@ def select_wheel(
     lock_text: str, version: str, system: str, arch: str
 ) -> tuple[str, str]:
     """Return the pinned wheel URL and SHA-256 digest for a platform."""
-    # tomllib arrived in Python 3.11. Import it here, not at module level,
-    # so a runner with an older python3 can still use the GitHub source;
-    # only this fallback needs it.
-    try:
-        import tomllib
-    except ImportError as exc:
-        raise FetchError(
-            "the PyPI fallback needs Python 3.11 or newer (tomllib)"
-        ) from exc
     try:
         packages = tomllib.loads(lock_text).get("package", [])
     except tomllib.TOMLDecodeError as exc:

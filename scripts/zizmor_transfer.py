@@ -25,8 +25,6 @@ much of the budget remains, and the download and the attestation check
 bound themselves by it, so a slow attempt cannot run past the deadline.
 """
 
-from __future__ import annotations
-
 import contextlib
 import hashlib
 import http.client
