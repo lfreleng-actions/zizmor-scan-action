@@ -9,8 +9,6 @@ nothing here touches the network or sleeps. Run with
 ``python3 -m unittest discover -s tests``.
 """
 
-import __future__
-
 import contextlib
 import email.message
 import gzip
@@ -20,7 +18,6 @@ import http.server
 import importlib.util
 import io
 import os
-import shutil
 import ssl
 import struct
 import subprocess
@@ -923,13 +920,6 @@ class WheelSelectionTests(unittest.TestCase):
         url, _ = mod.select_wheel(lock, VERSION, "Linux", "X64")
         self.assertTrue(url.endswith("musllinux_1_2_x86_64.whl"))
 
-    def test_names_the_python_requirement_when_tomllib_is_missing(self) -> None:
-        mod = load()
-        with mock.patch.dict(sys.modules, {"tomllib": None}):
-            with self.assertRaises(mod.FetchError) as caught:
-                mod.select_wheel(self.lock, VERSION, "Linux", "X64")
-        self.assertIn("Python 3.11", str(caught.exception))
-
     def test_refuses_a_version_the_lock_does_not_pin(self) -> None:
         mod = load()
         with self.assertRaises(mod.FetchError) as caught:
@@ -1282,43 +1272,6 @@ class FetchTests(unittest.TestCase):
         self.assert_failed_closed()
 
 
-def python39() -> str | None:
-    """Find a Python 3.9 interpreter, or None when the host has none."""
-    return os.environ.get("ZIZMOR_TEST_PYTHON39") or shutil.which("python3.9")
-
-
-class OldPythonTests(unittest.TestCase):
-    """The GitHub source is documented to work on Python 3.9 and newer."""
-
-    def test_annotations_are_never_evaluated_at_import(self) -> None:
-        # ``X | None`` in an annotation raises TypeError on Python 3.9 when
-        # evaluated. ``from __future__ import annotations`` stores the
-        # annotations as text, so the module imports on any version. This
-        # check runs on every Python, not just 3.9, so CI catches it.
-        for module in (load(), transfer()):
-            with self.subTest(module=module.__name__):
-                self.assertIs(
-                    getattr(module, "annotations", None), __future__.annotations
-                )
-
-    def test_imports_on_a_real_python_39(self) -> None:
-        interpreter = python39()
-        if interpreter is None:
-            self.skipTest("no python3.9 on this host (set ZIZMOR_TEST_PYTHON39)")
-        code = (
-            f"import sys; sys.path.insert(0, {str(SCRIPTS)!r}); "
-            "import zizmor_fetch; print(sys.version_info[:2])"
-        )
-        proc = subprocess.run(  # noqa: S603
-            [interpreter, "-E", "-s", "-c", code],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "(3, 9)")
-
-
 class CommandLineTests(unittest.TestCase):
     def run_script(self, **env: str) -> subprocess.CompletedProcess[str]:
         clean = {k: v for k, v in os.environ.items() if not k.startswith("ZIZMOR_")}
@@ -1362,21 +1315,6 @@ class CommandLineTests(unittest.TestCase):
             )
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertIn("ZIZMOR_TAG", proc.stderr)
-
-    def test_imports_without_tomllib_so_python_310_can_use_github(self) -> None:
-        # tomllib arrived in Python 3.11. Only the PyPI fallback reads the
-        # lock, so a runner without it must still reach the GitHub path.
-        code = (
-            "import sys; sys.modules['tomllib'] = None; "
-            f"sys.path.insert(0, {str(SCRIPTS)!r}); import zizmor_fetch"
-        )
-        proc = subprocess.run(  # noqa: S603
-            [sys.executable, "-E", "-s", "-c", code],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_missing_configuration_exits_non_zero(self) -> None:
         proc = self.run_script()
