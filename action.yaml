@@ -189,6 +189,7 @@ runs:
         WORKDIR: ${{ inputs.working-directory }}
         ZIZMOR_BIN: ${{ steps.download.outputs.zizmor }}
         RESOLVED_TAG: ${{ steps.resolve.outputs.tag }}
+        ACTION_PATH: ${{ github.action_path }}
         PYTHON: ${{ steps.python.outputs.python-path }}
       run: |
         set -euo pipefail
@@ -211,11 +212,15 @@ runs:
         # (11-14), so the outcomes are 0 (clean), 1 (internal error),
         # 2 (bad arguments) or 3 (no inputs). See zizmor's exit codes:
         # https://docs.zizmor.sh/usage/#exit-codes
+        # scripts/zizmor_audit.py retries an exit 1 whose stderr names a
+        # failed GitHub API request (twice, after 15 and 30 seconds),
+        # truncating the SARIF file before each attempt, and returns
+        # every other exit code from the first attempt unchanged.
         rc=0
         # Word-splitting of EXTRA_ARGS is intentional (passthrough).
         # shellcheck disable=SC2086
-        "${ZIZMOR_BIN}" "${args[@]}" ${EXTRA_ARGS} "${WORKDIR}" \
-          > "${tmp}" || rc=$?
+        "${PYTHON}" -I "${ACTION_PATH}/scripts/zizmor_audit.py" "${tmp}" \
+          "${ZIZMOR_BIN}" "${args[@]}" ${EXTRA_ARGS} "${WORKDIR}" || rc=$?
         if [ "${rc}" -eq 3 ]; then
           # No workflows, actions, or Dependabot config to audit (e.g. a
           # docs-only or fixture repository). Treat the empty audit as a

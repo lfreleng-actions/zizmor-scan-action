@@ -90,7 +90,9 @@ pushes.
    before it runs. The action retries transient failures (see
    [Download resilience](#download-resilience)). It never runs a binary
    that fails verification.
-4. zizmor audits the workspace in SARIF mode.
+4. zizmor audits the workspace in SARIF mode. The action retries an
+   audit that fails on a transient GitHub API error (see
+   [Audit resilience](#audit-resilience)).
 5. The action writes a findings summary to the job summary and, unless
    `annotate` is `'false'`, emits inline annotations.
 6. When `upload-sarif` is `'true'`, the action publishes the SARIF to
@@ -236,6 +238,27 @@ sets up meets that.
 
 `uv.lock` is the same file Dependabot already keeps current alongside
 `pyproject.toml`, so the fallback needs no extra maintenance.
+
+## Audit resilience
+
+zizmor's online audits, such as `known-vulnerable-actions` and
+`impostor-commit`, query the GitHub API. One dropped request makes
+zizmor exit 1 with `request error while accessing GitHub API`, which
+says nothing about the audited workflows. `scripts/zizmor_audit.py`
+retries that case alone: it makes at most two retries, waiting 15 and
+then 30 seconds, and logs a `::warning::` naming the failed attempt
+before each one. Every attempt starts from an empty SARIF file, so a
+failed attempt's output never gets published, and zizmor's stderr
+reaches the job log on every attempt.
+
+Every other outcome fails or passes at once, without a retry:
+
+- Exit 0 publishes the SARIF.
+- Exit 3 (no auditable inputs) writes an empty, clean SARIF.
+- Exit 2 (bad arguments), and exit 1 without that message, fail the
+  step with `zizmor exited with code <rc>`.
+
+When the retries run out, the step fails the same way.
 
 ## Security model
 
