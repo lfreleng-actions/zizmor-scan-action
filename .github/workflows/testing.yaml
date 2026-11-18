@@ -47,9 +47,9 @@ jobs:
         with:
           persist-credentials: false
 
-      # The summary script runs on the runner's system python3, so the
-      # tests use it and the standard library alone.
-      - name: "Test the summary script"
+      # The scripts need only the standard library, so the tests run on
+      # the runner's system python3.
+      - name: "Test the scripts"
         shell: bash
         run: python3 -m unittest discover -s tests -v
 
